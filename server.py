@@ -19,8 +19,8 @@ import numpy as np
 # ============================ CONFIG — EDIT THESE ============================
 SERIAL_PORT = os.environ.get("STRESS_PORT", "/dev/cu.usbmodem101")  # `ls /dev/cu.*` on macOS to find it
 BAUD        = int(os.environ.get("STRESS_BAUD", "115200"))          # must match Serial.begin() in the .ino
-MODEL_DIR   = os.environ.get("STRESS_MODEL", "/Users/mandeepwalia/Downloads/AI_slop/AI_piano_stress_final/outputs")        # holds fusionnet.pt, feature_scaler.npz, model_meta.json
-MUSIC_DIR   = os.environ.get("STRESS_MUSIC", "/Users/mandeepwalia/Downloads/AI_slop/AI_piano_stress_final/suno_ai_songs")  # optional: subfolders calm/ neutral/ elevated/
+MODEL_DIR   = os.environ.get("STRESS_MODEL", ".../outputs")        # holds fusionnet.pt, feature_scaler.npz, model_meta.json
+MUSIC_DIR   = os.environ.get("STRESS_MUSIC", ".../suno_ai_songs")  # optional: subfolders calm/ neutral/ elevated/
 HOST, PORT  = "127.0.0.1", 8000
 
 # --- Spotify (optional; only needed if you use the Spotify source in the dashboard) ---
