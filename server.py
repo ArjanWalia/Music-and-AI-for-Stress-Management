@@ -21,7 +21,9 @@ SERIAL_PORT = os.environ.get("STRESS_PORT", "/dev/cu.usbmodem101")  # `ls /dev/c
 BAUD        = int(os.environ.get("STRESS_BAUD", "115200"))          # must match Serial.begin() in the .ino
 MODEL_DIR   = os.environ.get("STRESS_MODEL", os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs"))        # holds fusionnet.pt, feature_scaler.npz, model_meta.json
 MUSIC_DIR   = os.environ.get("STRESS_MUSIC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "suno_ai_songs"))  # optional: subfolders calm/ neutral/ elevated/
-HOST, PORT  = "127.0.0.1", 8000
+PORT = int(os.environ.get("PORT", "8000"))          # cloud hosts (Render, etc.) inject $PORT automatically
+# Bind all interfaces when a platform PORT is present (so Render can route to it); loopback locally.
+HOST = os.environ.get("HOST", "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
 
 # --- Spotify (optional; only needed if you use the Spotify source in the dashboard) ---
 SPOTIFY_CLIENT_ID     = os.environ.get("SPOTIFY_CLIENT_ID", "")
