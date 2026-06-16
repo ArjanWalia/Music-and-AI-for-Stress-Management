@@ -19,8 +19,8 @@ import numpy as np
 # ============================ CONFIG — EDIT THESE ============================
 SERIAL_PORT = os.environ.get("STRESS_PORT", "/dev/cu.usbmodem101")  # `ls /dev/cu.*` on macOS to find it
 BAUD        = int(os.environ.get("STRESS_BAUD", "115200"))          # must match Serial.begin() in the .ino
-MODEL_DIR   = os.environ.get("STRESS_MODEL", ".../outputs")        # holds fusionnet.pt, feature_scaler.npz, model_meta.json
-MUSIC_DIR   = os.environ.get("STRESS_MUSIC", ".../suno_ai_songs")  # optional: subfolders calm/ neutral/ elevated/
+MODEL_DIR   = os.environ.get("STRESS_MODEL", os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs"))        # holds fusionnet.pt, feature_scaler.npz, model_meta.json
+MUSIC_DIR   = os.environ.get("STRESS_MUSIC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "suno_ai_songs"))  # optional: subfolders calm/ neutral/ elevated/
 HOST, PORT  = "127.0.0.1", 8000
 
 # --- Spotify (optional; only needed if you use the Spotify source in the dashboard) ---
@@ -41,6 +41,17 @@ SIM_WHEN_NO_SERIAL = True                   # if no Arduino is found, drive the 
 # ===========================================================================
 
 CHANNELS   = ["bpm", "eda", "hrv", "temp", "motion"]
+
+# ---- device profiles: each supported input device declares which channels it can deliver ----
+# Channels NOT listed for a device are treated as absent from the start (never "active"), so the
+# model scores from only the channels that device provides. `timeout` is the per-device staleness
+# window: HealthKit delivers periodic samples (not a 4 Hz stream), so the watch needs a longer one.
+DEVICE_PROFILES = {
+    "arduino":     {"channels": ["bpm", "eda", "hrv", "temp", "motion"], "timeout": 4.0,  "label": "Arduino kit"},
+    "apple_watch": {"channels": ["bpm", "hrv", "motion"],                "timeout": 45.0, "label": "Apple Watch"},
+}
+DEFAULT_DEVICE = "arduino"
+
 COMMON_HZ, WINDOW_SEC = 4, 60
 WIN = COMMON_HZ * WINDOW_SEC               # 240 samples / 60 s window
 FEAT_IDX_BY_CH = {"bpm": [0,1,2], "hrv": [3,4,5], "eda": [6,7,8,9], "temp": [10,11], "motion": [12,13]}
@@ -139,6 +150,8 @@ class Hub:
         self.last_hrv = None
         self.serial_ok = False; self.last_line = ""
         self.band = "calm"; self.band_since = time.time()
+        self.device = DEFAULT_DEVICE                # selected input device (gates which channels are eligible)
+        self.last_post_ts = 0.0                     # last time a watch/external POST landed (sim stands down when fresh)
         self.start = time.time()
 
 HUB = Hub()
@@ -212,15 +225,17 @@ def sampler_loop():
         time.sleep(dt)
 
 def simulate_loop():
-    """Synthetic 5-channel biosignal source — runs ONLY while no Arduino is connected.
-       A slow latent 'arousal' (0..1) drives the five channels in a physiologically coherent
-       way: heart rate up, HRV (RMSSD) down, EDA up with occasional phasic bursts, and skin
-       temperature down (peripheral vasoconstriction). It beats in real time, so a fresh HRV
-       lands every two beats and the whole pipeline behaves exactly like the real device."""
+    """Synthetic biosignal source — runs ONLY while no real input is arriving. It is device-aware:
+       in Apple Watch mode it fabricates only the channels a watch provides (BPM + HRV), so the demo
+       reflects the true partial-input path. A slow latent 'arousal' (0..1) drives the channels in a
+       physiologically coherent way (HR up, HRV down, EDA up, skin temp down). It beats in real time."""
     rng = np.random.default_rng(); a = 0.25; beat = 0
     while True:
-        if HUB.serial_ok or not SIM_WHEN_NO_SERIAL:                 # real hardware present -> stand down
+        # stand down if real hardware is connected, sim disabled, or fresh watch POSTs are arriving
+        watch_live = (HUB.device == "apple_watch") and ((time.time() - HUB.last_post_ts) < 60.0)
+        if HUB.serial_ok or not SIM_WHEN_NO_SERIAL or watch_live:
             time.sleep(0.5); continue
+        allowed = set(DEVICE_PROFILES.get(HUB.device, DEVICE_PROFILES[DEFAULT_DEVICE])["channels"])
         a += (0.30 - a) * 0.02 + rng.normal(0, 0.04)                # mean-reverting random walk...
         if rng.random() < 0.004: a += rng.uniform(0.20, 0.50)       # ...with occasional stress episodes
         a = float(np.clip(a, 0.02, 0.98))
@@ -232,28 +247,25 @@ def simulate_loop():
         motion = max(0.0, 1.0 + rng.normal(0, 0.03)               # ~1 g rest baseline + occasional movement
                      + (rng.uniform(0, 0.6) if rng.random() < 0.05 else 0.0))
         now = time.time(); new_hrv = (beat % 2 == 0)               # new RMSSD every two beats
+        vals = {"bpm": bpm, "eda": eda, "temp": temp, "motion": motion}
         with HUB.lock:
-            HUB.latest["bpm"]=bpm; HUB.latest["eda"]=eda; HUB.latest["temp"]=temp; HUB.latest["motion"]=motion
-            HUB.last_ts["bpm"]=HUB.last_ts["eda"]=HUB.last_ts["temp"]=HUB.last_ts["motion"]=now
-            if new_hrv:
+            for c in ("bpm", "eda", "temp", "motion"):
+                if c in allowed:                                    # only fabricate channels this device provides
+                    HUB.latest[c] = vals[c]; HUB.last_ts[c] = now
+            if new_hrv and "hrv" in allowed:
                 HUB.latest["hrv"]=rmssd; HUB.last_ts["hrv"]=now; HUB.last_hrv=rmssd
-            HUB.last_line = f"[SIM] bpm={bpm:.0f} hrv={rmssd:.0f} eda={eda:.2f} temp={temp:.1f} motion={motion:.2f}"
+            shown = " ".join(f"{c}={vals.get(c, rmssd if c=='hrv' else 0):.0f}" for c in allowed)
+            HUB.last_line = f"[SIM:{HUB.device}] {shown}"
         if new_hrv:
             run_inference()
         beat += 1
         time.sleep(60.0 / max(bpm, 40.0))                          # one beat interval
 
-def run_inference():
-    if MODEL is None:
-        return
-    now = time.time()
-    with HUB.lock:
-        active = {c: (HUB.latest[c] is not None) and ((now - HUB.last_ts[c]) < ACTIVE_TIMEOUT) for c in CHANNELS}
-        W = np.stack([np.array(HUB.ring[c], dtype=np.float32) for c in CHANNELS], axis=1)  # (WIN,5)
-        stats = {c: (HUB.mean[c], math.sqrt(HUB.M2[c]/HUB.n[c]) if HUB.n[c] > 1 else 0.0, HUB.n[c]) for c in CHANNELS}
-    total = max(stats[c][2] for c in CHANNELS)
-    calibrating = total < COMMON_HZ * CALIB_SEC
-
+def _score_from_window(W, stats, active):
+    """Shared inference core: given a (WIN,5) window, per-channel (mean,std,n) stats, and an
+    `active` map, run the model and return a 0-100 stress score. Inactive channels are zeroed
+    in BOTH the raw tensor and the feature vector, so the model scores from only what's present.
+    This is the SAME logic the Arduino path and the watch path both use."""
     Xc  = np.zeros((WIN, 5), np.float32)
     raw = np.zeros((WIN, 5), np.float32)
     for i, c in enumerate(CHANNELS):
@@ -278,7 +290,30 @@ def run_inference():
         xc = torch.tensor(Xc[None], dtype=torch.float32)
         xm = torch.tensor(feat[None], dtype=torch.float32)
         prob = float(torch.sigmoid(MODEL(xc, xm) / TEMP))
-    val = prob * 100.0
+    return prob * 100.0
+
+def _active_map(now):
+    """Which channels currently count as active, gated by the selected device profile:
+    a channel the chosen device can't provide is never active (so it's scored as absent)."""
+    prof = DEVICE_PROFILES.get(HUB.device, DEVICE_PROFILES[DEFAULT_DEVICE])
+    allowed = set(prof["channels"]); to = float(prof["timeout"])
+    return {c: (c in allowed) and (HUB.latest[c] is not None) and ((now - HUB.last_ts[c]) < to)
+            for c in CHANNELS}
+
+def run_inference():
+    if MODEL is None:
+        return
+    now = time.time()
+    with HUB.lock:
+        active = _active_map(now)
+        W = np.stack([np.array(HUB.ring[c], dtype=np.float32) for c in CHANNELS], axis=1)  # (WIN,5)
+        stats = {c: (HUB.mean[c], math.sqrt(HUB.M2[c]/HUB.n[c]) if HUB.n[c] > 1 else 0.0, HUB.n[c]) for c in CHANNELS}
+    # calibration baseline forms from only the channels this device actually streams
+    allowed = set(DEVICE_PROFILES.get(HUB.device, DEVICE_PROFILES[DEFAULT_DEVICE])["channels"])
+    total = max((stats[c][2] for c in CHANNELS if c in allowed), default=0)
+    calibrating = total < COMMON_HZ * CALIB_SEC
+
+    val = _score_from_window(W, stats, active)
 
     with HUB.lock:
         HUB.stress = val
@@ -305,7 +340,9 @@ def _update_band_locked(v):
 def snapshot():
     now = time.time()
     with HUB.lock:
-        active   = {c: (HUB.latest[c] is not None) and ((now - HUB.last_ts[c]) < ACTIVE_TIMEOUT) for c in CHANNELS}
+        prof = DEVICE_PROFILES.get(HUB.device, DEVICE_PROFILES[DEFAULT_DEVICE])
+        allowed = set(prof["channels"]); to = float(prof["timeout"])
+        active   = {c: (c in allowed) and (HUB.latest[c] is not None) and ((now - HUB.last_ts[c]) < to) for c in CHANNELS}
         readings = {c: (round(float(HUB.latest[c]), 2) if HUB.latest[c] is not None else None) for c in CHANNELS}
         return {
             "readings": readings, "active": active,
@@ -315,7 +352,8 @@ def snapshot():
             "band": HUB.band, "serial_ok": HUB.serial_ok,
             "source": ("live" if HUB.serial_ok else ("sim" if SIM_WHEN_NO_SERIAL else "none")),
             "model_loaded": MODEL is not None,
-            "n_active": sum(active.values()), "n_total": len(CHANNELS),
+            "device": HUB.device, "device_channels": prof["channels"],   # which channels THIS device provides (dashboard hides the rest)
+            "n_active": sum(active.values()), "n_total": len(allowed),    # totals are per-device (e.g. 2 for the watch)
             "session_sec": int(now - HUB.start), "last_line": HUB.last_line,
         }
 
@@ -356,6 +394,121 @@ def api_track(band: str = "calm"):
         played.add(name); PLAYED[band] = played
         remaining = len(files) - len(played)
     return JSONResponse({"url": f"/music/{band}/{name}", "name": name, "band": band, "remaining": remaining})
+
+# ---------------------------------------------------------------------------
+# Input-device selection + external-device (Apple Watch) score ingest.
+#   The dashboard asks which device is in use; that gates which channels are eligible.
+#   A phone app reads HealthKit (BPM, HRV) and POSTs here; the same model scores it and
+#   the result flows into the SAME band/music loop as the Arduino path.
+# ---------------------------------------------------------------------------
+@app.get("/api/device")
+def get_device():
+    prof = DEVICE_PROFILES.get(HUB.device, DEVICE_PROFILES[DEFAULT_DEVICE])
+    return JSONResponse({"device": HUB.device, "channels": prof["channels"], "label": prof["label"],
+                         "devices": {k: {"label": v["label"], "channels": v["channels"]} for k, v in DEVICE_PROFILES.items()}})
+
+@app.post("/api/device")
+async def set_device(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    dev = (body.get("device") or "").strip().lower()
+    if dev not in DEVICE_PROFILES:
+        return JSONResponse({"ok": False, "error": f"unknown device; choose one of {list(DEVICE_PROFILES)}"}, status_code=400)
+    with HUB.lock:
+        if dev != HUB.device:                          # switching device -> reset running stats so calibration is clean
+            HUB.device = dev
+            for c in CHANNELS:
+                HUB.latest[c] = None; HUB.last_ts[c] = 0.0
+                HUB.n[c] = 0; HUB.mean[c] = 0.0; HUB.M2[c] = 0.0
+                HUB.ring[c] = deque([np.nan]*WIN, maxlen=WIN)
+            HUB.stress = None; HUB.stress_smooth = None; HUB.calibrating = True
+            HUB.start = time.time()
+    prof = DEVICE_PROFILES[dev]
+    return JSONResponse({"ok": True, "device": dev, "channels": prof["channels"], "label": prof["label"]})
+
+def _preprocess_watch_payload(body):
+    """Convert raw Apple Watch data into the model's channels (server-side preprocessing).
+
+    Accepts whatever the iOS app sends, in any combination:
+      • rr_intervals / ibi / ibi_ms : beat-to-beat intervals from HKHeartbeatSeriesSample
+            -> BPM  = 60000 / mean(interval_ms)
+            -> HRV  = RMSSD = sqrt(mean(successive-difference^2))  (ms)
+      • accel / motion_samples      : [{x,y,z}, ...] from CMMotionManager
+            -> motion = mean(sqrt(x^2 + y^2 + z^2))   (per-session z-scoring handles scale)
+      • bpm / hrv / motion / ...     : already-computed values (used directly / to fill gaps)
+
+    Returns a dict of channel -> float for whatever could be derived."""
+    out = {}
+    # --- heart: derive BPM + RMSSD from inter-beat intervals (HKHeartbeatSeriesSample) ---
+    rr = body.get("rr_intervals") or body.get("ibi_ms") or body.get("ibi")
+    if isinstance(rr, list):
+        vals = [float(x) for x in rr if isinstance(x, (int, float)) and x > 0]
+        rr_ms = [(x * 1000.0 if x < 10 else x) for x in vals]   # HKHeartbeatSeries is in seconds; ms if already large
+        if len(rr_ms) >= 2:
+            out["bpm"] = 60000.0 / (sum(rr_ms) / len(rr_ms))
+            diffs = [rr_ms[i + 1] - rr_ms[i] for i in range(len(rr_ms) - 1)]
+            out["hrv"] = (sum(d * d for d in diffs) / len(diffs)) ** 0.5
+    # --- motion: magnitude of the acceleration vectors (CMMotionManager) ---
+    acc = body.get("accel") or body.get("motion_samples")
+    if isinstance(acc, list) and acc:
+        mags = []
+        for s in acc:
+            if isinstance(s, dict):
+                x, y, z = float(s.get("x", 0) or 0), float(s.get("y", 0) or 0), float(s.get("z", 0) or 0)
+                mags.append((x * x + y * y + z * z) ** 0.5)
+            elif isinstance(s, (int, float)):
+                mags.append(abs(float(s)))
+        if mags:
+            out["motion"] = sum(mags) / len(mags)
+    # --- direct, already-computed values win / fill any gaps (covers a simpler app that does its own math) ---
+    for c in CHANNELS:
+        v = body.get(c)
+        if isinstance(v, (int, float)):
+            out[c] = float(v)
+    return out
+
+@app.post("/api/score")
+async def api_score(request: Request):
+    """External device (e.g. iPhone reading Apple Watch HealthKit + CoreMotion) POSTs raw or computed
+    signals. They're preprocessed into BPM/HRV/motion, then only channels valid for the SELECTED device
+    are kept; the rest stay absent and the model scores from what's present — same logic as the Arduino path."""
+    """External device (e.g. iPhone reading Apple Watch HealthKit) POSTs the channels it has.
+    Only channels valid for the SELECTED device are accepted; the rest stay absent and the
+    model scores from what's present — identical logic to the Arduino path."""
+    if MODEL is None:
+        return JSONResponse({"error": "model not loaded on server"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    allowed = set(DEVICE_PROFILES.get(HUB.device, DEVICE_PROFILES[DEFAULT_DEVICE])["channels"])
+    derived = _preprocess_watch_payload(body)        # raw RR intervals / accel -> bpm, hrv, motion (+ any direct values)
+    incoming = {c: derived[c] for c in CHANNELS
+                if c in allowed and c in derived and isinstance(derived[c], (int, float))}
+    if not incoming:
+        return JSONResponse({"error": f"no usable channels for device '{HUB.device}'; expected any of {sorted(allowed)}"}, status_code=400)
+    now = time.time()
+    new_hrv = False
+    with HUB.lock:
+        HUB.last_post_ts = now
+        for c, v in incoming.items():
+            HUB.latest[c] = v; HUB.last_ts[c] = now
+            HUB.n[c] += 1                              # Welford update so per-session z-score works for POSTed data too
+            delta = v - HUB.mean[c]; HUB.mean[c] += delta / HUB.n[c]; HUB.M2[c] += delta * (v - HUB.mean[c])
+            HUB.ring[c].append(v)
+        if "hrv" in incoming and incoming["hrv"] != HUB.last_hrv:
+            new_hrv = True; HUB.last_hrv = incoming["hrv"]
+        HUB.last_line = f"[POST:{HUB.device}] " + " ".join(f"{c}={incoming[c]:.1f}" for c in incoming)
+    # HealthKit is periodic; score on each new HRV, or whenever HRV isn't among the channels
+    if new_hrv or "hrv" not in allowed:
+        run_inference()
+    with HUB.lock:
+        out = {"stress": None if HUB.stress_smooth is None else round(HUB.stress_smooth, 1),
+               "band": HUB.band, "calibrating": HUB.calibrating,
+               "channels_used": sorted(incoming), "device": HUB.device}
+    return JSONResponse(out)
 
 # ---------------------------------------------------------------------------
 # Per-user sessions (cookie 'sid'). Each browser gets its OWN Anthropic key,
@@ -707,9 +860,27 @@ window.onSpotifyWebPlaybackSDKReady = function(){ window._sdkLoaded = true; if (
 </style>
 </head>
 <body>
+<div id="devModal" style="position:fixed;inset:0;z-index:50;background:rgba(6,10,14,.86);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center">
+  <div style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:26px 26px 22px;max-width:420px;width:90%">
+    <div style="font-size:13px;letter-spacing:.16em;color:var(--muted);font-weight:600;margin-bottom:4px">SELECT INPUT DEVICE</div>
+    <div class="mono" style="font-size:11px;color:var(--faint);margin-bottom:18px">Choose what's measuring your biosignals. This sets which channels the model expects.</div>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <button class="devpick" data-dev="arduino" style="text-align:left;padding:13px 15px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--ink);cursor:pointer">
+        <div style="font-weight:600;font-size:14px">Arduino kit</div>
+        <div class="mono" style="font-size:10px;color:var(--muted);margin-top:3px">All 5 channels · BPM, HRV, EDA, skin temp, motion</div>
+      </button>
+      <button class="devpick" data-dev="apple_watch" style="text-align:left;padding:13px 15px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--ink);cursor:pointer">
+        <div style="font-weight:600;font-size:14px">Apple Watch</div>
+        <div class="mono" style="font-size:10px;color:var(--muted);margin-top:3px">3 channels · BPM, HRV, motion (HealthKit + CoreMotion → POST)</div>
+      </button>
+    </div>
+    <div class="mono" style="font-size:10px;color:var(--faint);margin-top:16px">You can switch devices later from the header.</div>
+  </div>
+</div>
 <header>
   <div class="brand"><b>BIOSIGNAL STRESS MONITOR</b><span>CLOSED-LOOP · v1.0</span></div>
   <div class="pill" id="simbadge" style="display:none;color:var(--motion);border-color:var(--motion)">SIMULATION MODE</div>
+  <div class="pill" id="devpill" style="cursor:pointer;color:var(--hrv);border-color:var(--hrv)" title="Switch input device">DEVICE</div>
   <div class="pill"><span id="leadcount">5/5 LEADS</span></div>
   <div class="pill"><span class="dot" id="dmodel"></span><span id="modeltxt">MODEL</span></div>
   <div class="spacer"></div>
@@ -825,6 +996,24 @@ for(const v of VITALS){
   const cv = card.querySelector("canvas");
   traces[v.key] = {cv, ctx:cv.getContext("2d"), buf:new Array(N).fill(null), active:true, meta:v, lastVal:null};
 }
+
+// ---- device handling: show ONLY the channels the selected device provides ----
+let deviceChannels = VITALS.map(v=>v.key);     // default: all five (Arduino)
+function applyDeviceChannels(chs){
+  if(chs && chs.length) deviceChannels = chs;
+  for(const v of VITALS){
+    const row=document.getElementById("row-"+v.key);
+    if(row) row.style.display = deviceChannels.includes(v.key) ? "" : "none";   // absent channels hidden entirely
+  }
+}
+async function chooseDevice(dev){
+  try{ await fetch("/api/device", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({device:dev})}); }catch(e){}
+  for(const k in traces){ traces[k].buf=new Array(N).fill(null); traces[k].lastVal=null; }   // clear traces on switch
+  document.getElementById("devModal").style.display="none";
+}
+document.querySelectorAll(".devpick").forEach(b=> b.onclick=()=>chooseDevice(b.dataset.dev));
+document.getElementById("devpill").onclick=()=>{ document.getElementById("devModal").style.display="flex"; };
+// the modal blocks until a device is picked on first load; the header pill reopens it later
 
 function ensureSize(t){                  // keep the canvas backing store matched to its CSS box (no overlap, crisp lines)
   const r=t.cv.getBoundingClientRect(); if(!r.width||!r.height) return false;
@@ -1211,6 +1400,9 @@ function setStatus(s){
   }
   dm.className="dot "+(s.model_loaded?"ok":"bad");  document.getElementById("modeltxt").textContent=s.model_loaded?"MODEL OK":"NO MODEL";
   document.getElementById("leadcount").textContent=s.n_active+"/"+s.n_total+" LEADS";
+  if(s.device){ const DL={arduino:"ARDUINO", apple_watch:"APPLE WATCH"};
+    document.getElementById("devpill").textContent = DL[s.device] || s.device.toUpperCase(); }
+  if(s.device_channels) applyDeviceChannels(s.device_channels);   // keep visible traces in sync with the device
   const t=s.session_sec, hh=String(Math.floor(t/3600)).padStart(2,"0"),
         mm=String(Math.floor(t%3600/60)).padStart(2,"0"), ss=String(t%60).padStart(2,"0");
   document.getElementById("clock").textContent=hh+":"+mm+":"+ss;
@@ -1218,7 +1410,9 @@ function setStatus(s){
 function connect(){
   const ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws");
   ws.onmessage=ev=>{ const s=JSON.parse(ev.data);
-    for(const v of VITALS){ const t=traces[v.key]; const act=s.active[v.key]; const r=s.readings[v.key];
+    for(const v of VITALS){ const t=traces[v.key];
+      if(!deviceChannels.includes(v.key)) continue;    // channel hidden for this device -> skip its trace updates
+      const act=s.active[v.key]; const r=s.readings[v.key];
       t.active=act; t.buf.push(act? r : null); if(t.buf.length>N)t.buf.shift();
       const el=document.getElementById("val-"+v.key);
       if(act && r!==t.lastVal){ el.textContent=fmt(r,v.dec); flashRead(v.key); t.lastVal=r; }   // new reading => update + flash (per beat; HRV per 2 beats)
